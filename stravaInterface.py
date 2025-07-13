@@ -6,75 +6,41 @@ import requests
 from stravalib.client import Client
 import json
 from datetime import datetime
-import qrcode
-import socket
 
-# ==== LOAD CONFIG ====
+# ==== LOAD CLIENT CONFIG ====
 with open('client.json', 'r') as f:
     client_config = json.load(f)
 CLIENT_ID = client_config['client_id']
 CLIENT_SECRET = client_config['client_secret']
+REDIRECT_URI = 'http://localhost:5000/authorized'
 
-# ==== GET LOCAL IP ====
-def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(('10.255.255.255', 1))
-        IP = s.getsockname()[0]
-    except Exception:
-        IP = '127.0.0.1'
-    finally:
-        s.close()
-    return IP
+# ==== LOAD USERS ====
+with open('users.json', 'r') as f:
+    users = json.load(f)
 
-LOCAL_IP = get_local_ip()
-REDIRECT_URI = f'http://{LOCAL_IP}:5000/authorized/'
-
-
+index = 0  # Select user to run with
+selected_user = users[index]
 
 # ==== GLOBALS ====
+auth_code = None
+auth_code_event = threading.Event()
 app = Flask(__name__)
+access_token = None
 
-# ==== FLASK ROUTE ====
 @app.route('/authorized')
 def authorized():
+    global auth_code
     error = request.args.get('error')
     if error:
         return f"Error: {error}"
 
-    code = request.args.get('code')
-    token_data = exchange_code_for_token(code)
-    if 'access_token' not in token_data:
-        return f"Token exchange failed: {token_data}"
+    auth_code = request.args.get('code')
+    auth_code_event.set()
+    return "Authorization successful! You can close this window now."
 
-    access_token = token_data['access_token']
-    client = Client(access_token=access_token)
-    athlete = client.get_athlete()
+def run_server():
+    app.run(port=5000)
 
-    new_user = {
-        "name": f"{athlete.firstname} {athlete.lastname}",
-        "id": athlete.id,
-        "access_token": access_token,
-        "refresh_token": token_data['refresh_token'],
-        "expires_at": token_data['expires_at']
-    }
-
-    try:
-        with open("users.json", "r") as f:
-            users = json.load(f)
-    except FileNotFoundError:
-        users = []
-
-    if not any(u.get("id") == athlete.id for u in users):
-        users.append(new_user)
-        with open("users.json", "w") as f:
-            json.dump(users, f, indent=2)
-        print(f"✅ Added new user: {new_user['name']}")
-        return f"Authorization successful! Welcome, {new_user['name']}! You can close this window."
-    else:
-        return f"{new_user['name']} is already authorized. You can close this window."
-
-# ==== AUTH ====
 def get_auth_url():
     scope = 'activity:read_all'
     return (
@@ -110,98 +76,133 @@ def refresh_token(refresh_token_val):
     )
     return response.json()
 
-# ==== QR CODE ====
-def generate_qr():
-    url = get_auth_url()
-    qr = qrcode.make(url)
-    qr.save("strava_auth_qr.png")
-    print("✅ QR code saved as strava_auth_qr.png")
-    print(f"📱 Open this link on your phone or scan the QR: {url}")
+def save_user_data():
+    users[index] = selected_user
+    with open('users.json', 'w') as f:
+        json.dump(users, f, indent=2)
 
-# ==== CALORIES ====
+def do_full_oauth_flow():
+    server_thread = threading.Thread(target=run_server, daemon=True)
+    server_thread.start()
+
+    auth_url = get_auth_url()
+    print("Opening browser to authenticate with Strava...")
+    webbrowser.open(auth_url)
+
+    print("Waiting for authorization...", end="", flush=True)
+    auth_code_event.wait()
+
+    print("\nGot authorization code. Exchanging for token...")
+    token_data = exchange_code_for_token(auth_code)
+    if 'access_token' not in token_data:
+        raise Exception(f"Failed to exchange token: {token_data}")
+
+    selected_user['access_token'] = token_data['access_token']
+    selected_user['refresh_token'] = token_data['refresh_token']
+    selected_user['expires_at'] = token_data['expires_at']
+    save_user_data()
+
+def ensure_valid_token():
+    global access_token
+    if 'access_token' in selected_user and 'expires_at' in selected_user:
+        if selected_user['expires_at'] > time.time():
+            access_token = selected_user['access_token']
+            return
+
+        print("Access token expired. Refreshing...")
+        token_data = refresh_token(selected_user['refresh_token'])
+        if 'access_token' not in token_data:
+            raise Exception(f"Token refresh failed: {token_data}")
+
+        selected_user['access_token'] = token_data['access_token']
+        selected_user['refresh_token'] = token_data['refresh_token']
+        selected_user['expires_at'] = token_data['expires_at']
+        save_user_data()
+        access_token = token_data['access_token']
+    else:
+        print("No valid token found. Starting full OAuth flow...")
+        do_full_oauth_flow()
+        access_token = selected_user['access_token']
+
+def print_last_5_activities(client):
+    print("\nFetching last 5 activities...")
+    try:
+        activities = client.get_activities(limit=5)
+        for a in activities:
+            print(f"- {a.name} ({a.id}) at {a.start_date_local}")
+    except Exception as e:
+        print("Failed to fetch activities:", e)
+
+def get_activities_since(client, since_date_str):
+    print(f"\nFetching activities since {since_date_str}...")
+    since_dt = datetime.strptime(since_date_str, "%Y-%m-%d")
+    activities = []
+
+    try:
+        for activity in client.get_activities(after=since_dt):
+            activities.append(activity)
+            print(f"- {activity.name} ({activity.distance} m) on {activity.start_date_local}")
+    except Exception as e:
+        print("Failed to fetch activities:", e)
+
+    print(f"Found {len(activities)} activities since {since_date_str}")
+    return activities
+
 def fetch_detailed_activity_raw(activity_id, access_token):
     url = f"https://www.strava.com/api/v3/activities/{activity_id}?include_all_efforts=false"
     headers = {"Authorization": f"Bearer {access_token}"}
     response = requests.get(url, headers=headers)
+
     if response.status_code == 200:
         return response.json()
     else:
         raise Exception(f"HTTP {response.status_code}: {response.text}")
 
-def get_activities_since(client, since_date_str):
-    since_dt = datetime.strptime(since_date_str, "%Y-%m-%d")
-    activities = []
-    try:
-        for activity in client.get_activities(after=since_dt):
-            activities.append(activity)
-    except Exception as e:
-        print("Failed to fetch activities:", e)
-    return activities
-
 def sum_calories(activities, access_token):
     total_calories = 0.0
+    missing_calories = 0
+
     for activity in activities:
         try:
             detailed = fetch_detailed_activity_raw(activity.id, access_token)
             calories = detailed.get('calories')
             if calories is not None:
                 total_calories += calories
+            else:
+                missing_calories += 1
         except Exception as e:
             print(f"⚠️ Error fetching activity {activity.id}: {e}")
+            missing_calories += 1
+
+    print(f"✔️ Total activities: {len(activities)} | Missing calorie data: {missing_calories}")
     return total_calories
 
-# ==== LEADERBOARD ====
-def run_leaderboard():
-    try:
-        with open("users.json", "r") as f:
-            users = json.load(f)
-    except FileNotFoundError:
-        print("No users found.")
-        return
 
-    results = []
-    since = "2025-06-01"
+def main_loop():
+    ensure_valid_token()
+    client = Client(access_token=access_token)
 
-    for user in users:
-        try:
-            if user['expires_at'] < time.time():
-                token_data = refresh_token(user['refresh_token'])
-                user['access_token'] = token_data['access_token']
-                user['refresh_token'] = token_data['refresh_token']
-                user['expires_at'] = token_data['expires_at']
-                with open("users.json", "w") as f:
-                    json.dump(users, f, indent=2)
+    # Save athlete name once
+    athlete = client.get_athlete()
+    print(f"Authenticated as: {athlete.firstname} {athlete.lastname}")
+    if 'name' not in selected_user:
+        selected_user['name'] = f"{athlete.firstname} {athlete.lastname}"
+        save_user_data()
 
-            client = Client(access_token=user['access_token'])
-            activities = get_activities_since(client, since)
-            total = sum_calories(activities, user['access_token'])
-            results.append((user['name'], total))
-        except Exception as e:
-            print(f"Error with user {user.get('name', '?')}: {e}")
+    while True:
+        ensure_valid_token()
+        client = Client(access_token=access_token)
+        date = "2025-06-01"
+        activities = get_activities_since(client, since_date_str="2025-06-01")  # or any date you choose
 
-    results.sort(key=lambda x: x[1], reverse=True)
-    print("\n===== Calories Leaderboard =====")
-    for name, cal in results:
-        print(f"{name}: {cal:.2f} kcal")
-    print("================================\n")
+        total_calories = sum_calories(activities, access_token)
+        print(f"{total_calories} Calories burned since {date}")
 
-# ==== SERVER START ====
-def start_server():
-    print(f"🚀 Starting server at http://{LOCAL_IP}:5000")
-    app.run(host='0.0.0.0', port=5000)
-
-# ==== MAIN ====
-def main():
-    threading.Thread(target=start_server, daemon=True).start()
-    generate_qr()
-
-    try:
-        while True:
-            run_leaderboard()
-            print("Sleeping for 3 hours...\n")
-            time.sleep(3 * 3600)
-    except KeyboardInterrupt:
-        print("\nStopped by user.")
+        print("Sleeping for 3 hours...\n")
+        time.sleep(3 * 3600)
 
 if __name__ == '__main__':
-    main()
+    try:
+        main_loop()
+    except KeyboardInterrupt:
+        print("\nStopped by user.")

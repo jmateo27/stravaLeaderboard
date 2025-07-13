@@ -1,2 +1,4 @@
 myenv/
 users.json
+strava_auth_qr.py
+client.json
